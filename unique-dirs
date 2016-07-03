@@ -348,16 +348,11 @@ if ($ndirs > $max_size) {
     }
 
     my @scored_dirs = sort { path_score($a) <=> path_score($b); } @dirs;
-
-    if ($max_size != 0) {
-        @dirs = ();
-        for (my $i = 0; $i < $max_size; ++$i) {
-            $dirs[$i] = $scored_dirs[$i];
-        }
+    my $limit = scalar(@dirs);
+    if ($max_size != 0 && $limit > $max_size) {
+        $limit = $max_size;
     }
-    else {
-        @dirs = @scored_dirs;
-    }
+    @dirs = @scored_dirs[0 .. $limit - 1];
 }
 
 for (sort @dirs) {
