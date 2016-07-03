@@ -1,0 +1,371 @@
+#! /usr/bin/perl -w
+    eval 'exec /usr/bin/perl -S $0 ${1+"$@"}'
+        if 0; #$running_under_some_shell
+
+# Filename: unique-dirs
+# Brief: Winnow a list of paths to a unique list of directories of interest
+#
+# Copyright (C) 2016 Guy Shaw
+# Written by Guy Shaw <gshaw@acm.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as
+# published by the Free Software Foundation; either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=pod
+
+=begin description
+
+Winnow a list of pathnames.
+
+Select only directories.
+Select directory names of interest.
+Prune all path components _below_ the directories of interest.
+Keep only unique occurrences of the direcory path names that remain.
+
+If the list is still larger than desired, then
+sort by the remaining paths by score,
+where "score" is how many occurrences of names of interest
+have occurred _below_ that path, even if those lower-level
+components have been pruned in some earlier stage.
+
+=end description
+
+=cut
+
+require 5.0;
+use strict;
+use warnings;
+use Carp;
+use diagnostics;
+use Getopt::Long;
+use File::Spec::Functions qw(catfile splitpath);
+
+my $eprint_fh;
+my $dprint_fh;
+
+my $debug      = 0;
+my $verbose    = 0;
+my $max_size   = 0;
+my $show_score = 0;
+
+my @include_path_re = ();
+my @exclude_path_re = ();
+my @include_sfn_re  = ();
+my @exclude_sfn_re  = ();
+
+my @options = (
+    'debug'           => \$debug,
+    'verbose'         => \$verbose,
+    'max-size=i'      => \$max_size,
+    'include-path=s'  => \@include_path_re,
+    'exclude-path=s'  => \@exclude_path_re,
+    'include-sfn=s'   => \@include_sfn_re,
+    'exclude-sfn=s'   => \@include_sfn_re,
+    'score'           => \$show_score,
+);
+
+my @dirs   = ();
+my %scores = ();
+my %count  = ();
+
+#:subroutines:#
+
+# Decide how to direct eprint*() and dprint*() functions.
+# If STDOUT and STDERR are directed to the same "channel",
+# then eprint*() and dprint*() should be tied to the same file handle.
+#
+# Otherwise, buffering could cause a mix of STDOUT and STDERR to
+# be written out of order.
+#
+sub set_print_fh {
+    my @stdout_statv;
+    my @stderr_statv;
+    my $stdout_chan;
+    my $stderr_chan;
+
+    @stdout_statv = stat(*STDOUT);
+    @stderr_statv = stat(*STDERR);
+    $stdout_chan = join(':', @stdout_statv[0, 1, 6]);
+    $stderr_chan = join(':', @stderr_statv[0, 1, 6]);
+    if (!defined($eprint_fh)) {
+        $eprint_fh = ($stderr_chan eq $stdout_chan) ? *STDOUT : *STDERR;
+    }
+    if (!defined($dprint_fh)) {
+        $dprint_fh = ($stderr_chan eq $stdout_chan) ? *STDOUT : *STDERR;
+    }
+}
+
+sub eprint {
+    if (-t $eprint_fh) {
+        print {$eprint_fh} "\e[01;31m\e[K", @_, "\e[m\e[K";
+    }
+    else {
+        print {$eprint_fh} @_;
+    }
+}
+
+sub eprintf {
+    if (-t $eprint_fh) {
+        print  {$eprint_fh}  "\e[01;31m\e[K";
+        printf {$eprint_fh} @_;
+        print  {$eprint_fh}  "\e[m\e[K";
+    }
+    else {
+        printf {$eprint_fh} @_;
+    }
+}
+
+sub dprint {
+    print {$dprint_fh} @_ if ($debug);
+}
+
+sub dprintf {
+    printf {$dprint_fh} @_ if ($debug);
+}
+
+sub filter_path_include {
+    my ($path) = @_;
+
+    return 1  if (scalar(@include_path_re) == 0);
+
+    for my $re (@include_path_re) {
+        if ($path =~ m{$re}msx) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub filter_path_exclude {
+    my ($path) = @_;
+
+    return 1  if (scalar(@exclude_path_re) == 0);
+
+    for my $re (@exclude_path_re) {
+        if ($path =~ m{$re}msx) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+sub filter_path {
+    return filter_path_include(@_) && filter_path_exclude(@_);
+}
+
+sub filter_sfn_include {
+    my ($path) = @_;
+
+    return 1  if (scalar(@include_sfn_re) == 0);
+
+    for my $re (@include_sfn_re) {
+        if ($path =~ m{$re}msx) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub filter_sfn_exclude {
+    my ($path) = @_;
+
+    return 1  if (scalar(@exclude_sfn_re) == 0);
+
+    for my $re (@exclude_sfn_re) {
+        if ($path =~ m{$re}msx) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+sub filter_sfn {
+    return filter_sfn_include(@_) && filter_sfn_exclude(@_);
+}
+
+sub prune_path {
+    my ($path) = @_;
+    my ($vol, $dir, $sfn);
+
+    while (1) {
+        ($vol, $dir, $sfn) = splitpath($path);
+        if (defined($dir) && defined($sfn) && filter_sfn($sfn)) {
+            my $rpath = catfile($dir, $sfn);
+            $rpath =~ s{/\z}{}msx;
+            return $rpath;
+        }
+        return ''  if (!defined($dir) || $dir eq '');
+        if ($dir eq $path) {
+            my $rpath = $path;
+            $rpath =~ s{/\z}{}msx;
+            return $rpath;
+        }
+        $path = $dir;
+    }
+}
+
+sub add_path_score {
+    my ($path, $weight) = @_;
+    my $score;
+
+    $path =~ s{/\z}{}msx;
+    $score = $scores{$path} || 0;
+    $score += $weight;
+    $scores{$path} = $score;
+    dprint "add_path_score(path=[${path}], ${weight})\n";
+}
+
+sub award_path_scores {
+    my ($path) = @_;
+    my $dilution = 1;
+
+    $path =~ s{/\z}{}msx;
+    while (substr($path, 1) =~ m{/}msx) {
+        my ($vol, $dir, $sfn);
+        my $parent;
+
+        ($vol, $dir, $sfn) = splitpath($path);
+        $dir =~ s{/\z}{}msx;
+        if (filter_sfn($sfn)) {
+            add_path_score($path, 1 / $dilution);
+
+            # Award points to all ancestor directories
+            # because they contain a component of interest
+
+            $parent = $dir;
+            while (substr($parent, 1) =~ m{/}msx) {
+                $dilution *= 2;
+                add_path_score($parent, 1 / $dilution);
+                ($vol, $dir, $sfn) = splitpath($parent);
+                $dir =~ s{/\z}{}msx;
+                $parent = $dir;
+                dprint "parent=[$parent]\n";
+            }
+        }
+        $path = $dir;
+    }
+}
+
+sub path_score {
+    my ($path) = @_;
+    my $score = $scores{$path};
+    if (!defined($score)) {
+        eprint "No score for path=[${path}].\n";
+        $score = 0;
+    }
+    return $score;
+}
+
+sub maybe_path_score {
+    my ($path) = @_;
+    my $score = $scores{$path};
+    if (!defined($score)) {
+        $score = 0;
+    }
+    return $score;
+}
+
+#:options:#
+
+set_print_fh();
+
+GetOptions(@options) or exit 2;
+
+@include_path_re = map { qr{$_}; } @include_path_re;
+@exclude_path_re = map { qr{$_}; } @exclude_path_re;
+@include_sfn_re  = map { qr{$_}; } @include_sfn_re;
+@exclude_sfn_re  = map { qr{$_}; } @exclude_sfn_re;
+
+#:main:#
+
+my $ndirs;
+
+sub path_count {
+    my ($path) = @_;
+    my $cnt;
+
+    $cnt = $count{$path};
+    if (!defined($cnt)) {
+        $cnt = 0;
+    }
+    ++$cnt;
+    $count{$path} = $cnt;
+    return $cnt;
+}
+
+# Read the "raw" list of pathnames.
+# If there are any explicit include-path options,
+# then exclude anything not included.
+# Exclude anything explicitly included.
+#
+# Of what remains ...
+# Prune trailing path components that are not of interest.
+# Save unique occurences of the directories that remain.
+# Calculate a path score for each surviving path.
+#
+while (<>) {
+    chomp;
+    s{\r\z}{}msx;
+    s{/\z}{}msx;
+    if (filter_path($_)) {
+        if (! -d $_) {
+            s{/[^/]+\z}{}msx;
+        }
+        $_ = prune_path($_);
+        award_path_scores($_);
+        my $cnt = path_count($_);
+        next  if ($cnt >= 2);
+        if (maybe_path_score($_) != 0) {
+            push(@dirs, $_);
+        }
+    }
+}
+
+$ndirs = scalar(@dirs);
+if ($ndirs > $max_size) {
+    # The list of directories is still bigger than we would like.
+    # Sort remaining pathnames by score, pick the top $max_size.
+
+    if ($debug) {
+        dprint "ndirs=${ndirs}.\n";
+        for (@dirs) {
+            dprint '  ', $_, "\n";
+        }
+    }
+
+    my @scored_dirs = sort { path_score($a) <=> path_score($b); } @dirs;
+
+    if ($max_size != 0) {
+        @dirs = ();
+        for (my $i = 0; $i < $max_size; ++$i) {
+            $dirs[$i] = $scored_dirs[$i];
+        }
+    }
+    else {
+        @dirs = @scored_dirs;
+    }
+}
+
+for (sort @dirs) {
+    print $_;
+    if ($show_score) {
+        printf ' (%u)', $scores{$_} || 0;
+    }
+    print "\n";
+}
+
+exit 0;
